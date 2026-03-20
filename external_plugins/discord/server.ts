@@ -18,6 +18,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import {
   Client,
+  EmbedBuilder,
   GatewayIntentBits,
   Partials,
   ChannelType,
@@ -435,12 +436,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Discord. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or other files.',
+        'Reply on Discord. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, files (absolute paths) to attach, and embed for rich formatted cards. When embed is provided, text becomes optional (set to empty string if embed-only).',
       inputSchema: {
         type: 'object',
         properties: {
           chat_id: { type: 'string' },
-          text: { type: 'string' },
+          text: { type: 'string', description: 'Message text. Can be empty string if using embed only.' },
           reply_to: {
             type: 'string',
             description: 'Message ID to thread under. Use message_id from the inbound <channel> block, or an id from fetch_messages.',
@@ -449,6 +450,32 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'array',
             items: { type: 'string' },
             description: 'Absolute file paths to attach (images, logs, etc). Max 10 files, 25MB each.',
+          },
+          embed: {
+            type: 'object',
+            description: 'Rich embed card. All fields optional. Use for structured responses, status updates, summaries.',
+            properties: {
+              title: { type: 'string' },
+              description: { type: 'string', description: 'Main body text. Supports markdown.' },
+              color: { type: 'number', description: 'Decimal color (e.g. 3447003 for blue, 15548997 for red, 5763719 for green, 16760576 for orange).' },
+              url: { type: 'string', description: 'URL the title links to.' },
+              fields: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string' },
+                    value: { type: 'string' },
+                    inline: { type: 'boolean', description: 'Display side-by-side with adjacent inline fields.' },
+                  },
+                  required: ['name', 'value'],
+                },
+                description: 'Structured key-value fields. Max 25.',
+              },
+              footer: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+              thumbnail: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
+              image: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
+            },
           },
         },
         required: ['chat_id', 'text'],
@@ -520,6 +547,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
+        const embedArg = args.embed as Record<string, unknown> | undefined
 
         const ch = await fetchAllowedChannel(chat_id)
         if (!('send' in ch)) throw new Error('channel is not sendable')
@@ -533,11 +561,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         if (files.length > 10) throw new Error('Discord allows max 10 attachments per message')
 
+        // Build embed if provided
+        let embed: EmbedBuilder | undefined
+        if (embedArg) {
+          embed = new EmbedBuilder()
+          if (embedArg.title) embed.setTitle(embedArg.title as string)
+          if (embedArg.description) embed.setDescription(embedArg.description as string)
+          if (embedArg.color != null) embed.setColor(embedArg.color as number)
+          if (embedArg.url) embed.setURL(embedArg.url as string)
+          if (embedArg.footer) embed.setFooter(embedArg.footer as { text: string })
+          if (embedArg.thumbnail) embed.setThumbnail((embedArg.thumbnail as { url: string }).url)
+          if (embedArg.image) embed.setImage((embedArg.image as { url: string }).url)
+          const fields = embedArg.fields as Array<{ name: string; value: string; inline?: boolean }> | undefined
+          if (fields?.length) embed.addFields(fields.slice(0, 25))
+        }
+
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
+        const chunks = text ? chunk(text, limit, mode) : ['']
         const sentIds: string[] = []
 
         try {
@@ -547,7 +590,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
             const sent = await ch.send({
-              content: chunks[i],
+              content: chunks[i] || undefined,
+              ...(i === 0 && embed ? { embeds: [embed] } : {}),
               ...(i === 0 && files.length > 0 ? { files } : {}),
               ...(shouldReplyTo
                 ? { reply: { messageReference: reply_to, failIfNotExists: false } }
@@ -636,7 +680,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 await mcp.connect(new StdioServerTransport())
 
 client.on('messageCreate', msg => {
-  if (msg.author.bot) return
+  // Allow bots that are explicitly in the guild channel allowlist or DM allowlist.
+  // Block all other bots (and always block self to prevent loops).
+  if (msg.author.id === client.user?.id) return
+  if (msg.author.bot) {
+    const access = loadAccess()
+    const isAllowedDM = msg.channel.type === ChannelType.DM && access.allowFrom.includes(msg.author.id)
+    const channelKey = msg.channel.isThread?.()
+      ? (msg.channel as any).parentId ?? msg.channelId
+      : msg.channelId
+    const isAllowedGroup = (access.groups[channelKey]?.allowFrom ?? []).includes(msg.author.id)
+    if (!isAllowedDM && !isAllowedGroup) return
+  }
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
